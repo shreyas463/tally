@@ -88,7 +88,12 @@ WITH incoming AS (
 ),
 inserted AS (
     INSERT INTO events (event_id, name, distinct_id, properties, ts)
-    SELECT event_id, name, distinct_id, properties::jsonb, ts FROM incoming
+    SELECT event_id, name, distinct_id, properties::jsonb, ts
+    FROM incoming
+    -- Same reasoning as the rollup below: order the inserts by event_id so
+    -- concurrent batches that share duplicate ids take the unique-index locks
+    -- in the same order and queue instead of deadlocking.
+    ORDER BY event_id
     ON CONFLICT (event_id) DO NOTHING
     RETURNING name, ts
 ),
@@ -97,6 +102,12 @@ rolled AS (
     SELECT name, date_trunc('minute', ts), count(*)
     FROM inserted
     GROUP BY 1, 2
+    -- Deterministic lock order (name, minute). Without this, two worker
+    -- batches touching the same minute buckets can grab the per-row locks
+    -- in opposite orders and deadlock under concurrency — which a load test
+    -- reproduced. Ordering the upsert makes every batch take locks in the
+    -- same order, so they queue instead of deadlocking.
+    ORDER BY 1, 2
     ON CONFLICT (name, minute)
     DO UPDATE SET n = event_counts_minute.n + EXCLUDED.n
 )
