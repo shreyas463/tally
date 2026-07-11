@@ -1,0 +1,14 @@
+# Binaries
+/bin/
+*.exe
+
+# Env & secrets
+.env
+*.local
+
+# OS
+.DS_Store
+
+# Go workspace
+go.work
+go.work.sum
