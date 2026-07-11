@@ -1,0 +1,9 @@
+.git
+bin/
+docs/
+deploy/
+loadtest/
+scripts/
+*.md
+.github/
+docker-compose.yml

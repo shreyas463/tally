@@ -45,6 +45,29 @@ services:
       timeout: 5s
       retries: 12
 
+  # Metrics stack. Started only with: docker compose --profile obs up -d
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: [obs]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # linux support
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: [obs]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
 volumes:
   pgdata:
   redpanda:

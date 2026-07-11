@@ -4,13 +4,11 @@
 
 Tally swallows a firehose of "this happened" events (clicks, views, purchases), counts them all without dropping any, and answers "how many happened?" instantly. It's a small, from-scratch version of the engine behind tools like Google Analytics or Mixpanel.
 
-<!-- Badges — uncomment once CI is set up
-![Build](https://img.shields.io/badge/build-passing-brightgreen)
+[![CI](https://github.com/shreyas463/tally/actions/workflows/ci.yml/badge.svg)](https://github.com/shreyas463/tally/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
--->
 
-<!-- Demo gif goes here once the dashboard + load test exist (see docs/media) -->
+<!-- Demo gif goes here once recorded (see docs/media/README.md) -->
 <!-- ![Tally handling a live load test](docs/media/demo.gif) -->
 
 ---
@@ -25,26 +23,19 @@ Picture an online store with a **"Buy" button**:
 - Tally's one job is to **keep count**.
 - Later, the store owner asks: *"how many people clicked Buy today?"* — and Tally instantly answers: *"5,000."*
 
-Messages pour **in** ("this happened", "this happened"…), and totals come **out** ("it happened 5,000 times").
-
-The reason this is a whole project — and not a 10-minute task — is **scale**. Counting a few clicks is trivial. But real apps have things happening *tens of thousands of times per second*, non-stop. Doing that without slowing down or losing a single event is the hard, interesting part.
-
----
-
-## The problem it solves
-
-Businesses need to know what their users are doing — which features get used, whether traffic is growing, what's converting. But at high volume, the naive approach (save every single event straight to a database the moment it arrives) gets slow and starts dropping data. Tally is the reliable machinery that sits in the middle and makes that counting survive real scale and even crashes.
+Messages pour **in**, totals come **out**. The reason this is a whole project — and not a 10-minute task — is **scale**: real apps generate events tens of thousands of times per second, non-stop. Counting that fast without slowing down, losing events, or double-counting is the hard, interesting part.
 
 ---
 
 ## Features
 
-- **Ingests events at high volume** — an HTTP API that accepts a heavy stream of events without slowing down.
-- **Loses nothing** — even if a background worker crashes mid-job, no events are dropped.
-- **Doesn't double-count** — a duplicate event (networks resend sometimes) is counted only once.
-- **Answers questions instantly** — keeps running totals, so "how many today?" returns immediately.
-- **Protects itself** — per-client rate limiting and backpressure ("slow down, I'm full") instead of crashing.
-- **Proven, not just claimed** — load-tested with real, published numbers (see [Benchmarks](#benchmarks)).
+- **High-volume ingest** — accepts events fast because it never makes a caller wait on the database (queue in the middle, batched writes behind).
+- **Loses nothing** — graceful shutdown drains every accepted event; in durable mode, even a `SIGKILL`ed worker loses zero events (there's a [script that proves it](scripts/chaos.sh)).
+- **Never double-counts** — every write is idempotent; retries, crashes, and duplicate sends can't inflate a number.
+- **Instant answers** — per-minute rollups make "how many today?" a summation over a few hundred rows, not a scan over millions.
+- **Protects itself** — per-client rate limits (429) and queue-full backpressure (503 + Retry-After) instead of falling over.
+- **Observable** — Prometheus metrics, pprof profiling, a provisioned Grafana dashboard, and a built-in live dashboard at `/`.
+- **Honest numbers** — [BENCHMARKS.md](BENCHMARKS.md) publishes measured results only, with the methodology to reproduce them.
 
 ---
 
@@ -53,77 +44,79 @@ Businesses need to know what their users are doing — which features get used, 
 ```mermaid
 flowchart LR
     A["Your apps<br/>(send events)"] -->|"click / view / purchase"| B["Ingest API"]
-    B -->|"drop onto the conveyor belt"| C[("Queue<br/>(buffer)")]
+    B -->|"drop onto the conveyor belt"| C[("Queue<br/>memory or Redpanda")]
     C -->|"pulled in batches"| D["Workers"]
-    D -->|"tally + store"| E[("Postgres<br/>(totals)")]
-    Q["Query API / Dashboard"] -->|"how many today?"| E
-    B -.->|"rate-limit + dedupe"| R[("Redis")]
+    D -->|"one atomic statement:<br/>insert + rollup"| E[("Postgres")]
+    Q["Dashboard / Query API"] -->|"how many today?"| E
+    B -.->|"rate limit"| R[("Redis")]
 ```
 
-1. **An app sends an event** → the **Ingest API** catches it.
-2. The API immediately drops it onto a **queue** (a conveyor belt) and replies "got it" — it does *not* wait to save it. Accept fast, process later.
-3. **Workers** pull events off the belt in **batches** (saving 1,000 at once is far faster than one at a time).
-4. Workers **tally** the events and store the running totals in **Postgres**.
-5. The **Query API / dashboard** reads those totals to answer "how many?" instantly.
+1. **An app sends an event** → the **Ingest API** validates it and drops it on a **queue**, replying `202` immediately. Accept fast, process later.
+2. **Workers** pull events off in **batches** (1,000 at a time or every 200ms) — one database round-trip per batch instead of per event.
+3. Each batch lands in **one atomic SQL statement** that inserts the raw events, skips duplicates, and increments per-minute rollup counters — counting only rows that were *actually* inserted, so a replayed batch can't double-count.
+4. The **dashboard and query API** read the rollups for instant answers.
 
-> **Today (Phase 0)** the Ingest API writes straight to Postgres — the simplest version that works end-to-end. The queue and workers land in Phase 1 (see [Roadmap](#roadmap)).
+### Two queue backends
 
----
+| | `QUEUE=memory` (default) | `QUEUE=kafka` |
+|---|---|---|
+| What it is | Bounded in-process channel | Redpanda (Kafka API) broker |
+| Speed | Fastest | An extra hop (the durability tax) |
+| Survives a crash/restart | Queued events die with the process | **Yes** — offsets commit only *after* a batch is stored, so killed workers' work is redelivered and deduped |
+| Scale shape | One process | `MODE=ingest` / `MODE=worker` run and scale as separate processes |
 
-## Architecture (technical)
-
-- **Ingest API** — Go HTTP (later gRPC) handler. Validates events, applies per-key rate limiting (Redis token bucket), and enqueues. Returns fast; never blocks on the database.
-- **Queue** — a buffered channel to start (Phase 1), swapped for a real broker (NATS or Kafka via Redpanda) to survive restarts (Phase 2).
-- **Workers** — a pool of goroutines consuming the queue, batching writes, and doing idempotent upserts so duplicates and retries can't corrupt counts.
-- **Store** — Postgres, with batch upserts and time-based partitioning for the aggregate tables.
-- **Delivery guarantee** — **at-least-once** delivery + **idempotent consumers**. (Exactly-once across a network is effectively a myth; the writeup in `docs/adr/` explains why and where dedupe actually happens.)
-- **Reliability** — graceful shutdown drains in-flight work on `SIGTERM`; backpressure returns `429`/`503` rather than dropping data.
-- **Observability** — Prometheus metrics + Grafana dashboards; `pprof` for profiling.
-
----
-
-## Tech stack
-
-| Concern | Choice |
-|---|---|
-| Language | Go |
-| Queue | Buffered channel → NATS / Redpanda (Kafka API) |
-| Storage | Postgres (+ ClickHouse later for fast aggregation) |
-| Cache / rate limiting | Redis |
-| Load testing | k6 |
-| Observability | Prometheus + Grafana, pprof |
-| Deploy | Docker Compose → Kubernetes |
+That "commit only after storing, dedupe on replay" pair is the classic **at-least-once delivery + idempotent consumer** pattern — [ADR 0003](docs/adr/0003-durable-queue-and-crash-safety.md) explains it and its honest limits.
 
 ---
 
 ## Quick start
 
-**Prerequisites:** [Go 1.22+](https://go.dev/dl/) and [Docker](https://www.docker.com/) installed.
+**Prerequisites:** [Go 1.22+](https://go.dev/dl/) and [Docker](https://www.docker.com/).
 
 ```bash
-make setup     # download Go dependencies
-make up        # start Postgres + Redis in Docker
-make migrate   # create the events table
+make up        # start Postgres + Redis
+make migrate   # create tables
 make run       # start Tally on http://localhost:8080
 ```
 
-Then, in another terminal, send an event and read the count:
+Open **http://localhost:8080** — that's the live dashboard. Then:
 
 ```bash
-# Send one "buy_click" event
+# Send one event
 curl -X POST http://localhost:8080/v1/events \
   -H 'Content-Type: application/json' \
   -d '{"event_id":"evt-1","name":"buy_click","distinct_id":"user_42"}'
 
-# Ask how many "buy_click" events happened today
+# Ask how many happened today
 curl "http://localhost:8080/v1/counts?event=buy_click"
 # => {"event":"buy_click","count_today":1}
+
+# Send the SAME event again — the count stays 1 (idempotency)
+curl -X POST http://localhost:8080/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"evt-1","name":"buy_click","distinct_id":"user_42"}'
 ```
 
-Fire a burst of fake traffic at it:
+Fire fake traffic and watch the dashboard tick:
 
 ```bash
-make loadtest   # sends ~2,000 events/sec for 10s
+make loadtest                                  # ~2,000 events/sec for 10s
+go run ./cmd/loadgen -rate 5000 -duration 30s  # heavier, with p50/p95/p99 report
+go run ./cmd/loadgen -rate 1000 -dupes 20      # 20% duplicate sends — counts stay exact
+```
+
+### Durable mode + the chaos demo
+
+```bash
+make kafka-up                  # adds Redpanda
+make build
+make chaos                     # kills a worker mid-stream, proves 0 events lost
+```
+
+### Metrics stack
+
+```bash
+make obs-up                    # Prometheus :9090 + Grafana :3000 (dashboard pre-provisioned)
 ```
 
 ---
@@ -132,33 +125,60 @@ make loadtest   # sends ~2,000 events/sec for 10s
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/events` | Ingest one event. Body: `{event_id, name, distinct_id, properties?}` |
-| `GET`  | `/v1/counts?event=NAME` | How many events of `NAME` happened today |
-| `GET`  | `/healthz` | Liveness check |
+| `POST` | `/v1/events` | Ingest one event: `{event_id, name, distinct_id, properties?}` → `202`, `429` (over your rate limit), or `503` (backpressure) |
+| `GET` | `/v1/counts?event=NAME` | Today's count for one event name |
+| `GET` | `/v1/stats` | Today's totals per name + last-15-min per-minute series |
+| `GET` | `/` | Built-in live dashboard |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/healthz` | Liveness |
+| `GET` | `/debug/pprof/` | Profiling |
+
+## Configuration (env vars)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ADDR` | `:8080` | Listen address |
+| `DATABASE_URL` | local dev DSN | Postgres connection string |
+| `QUEUE` | `memory` | `memory` or `kafka` |
+| `MODE` | `all` | `all`, `ingest`, or `worker` (kafka only) |
+| `QUEUE_SIZE` | `100000` | Queue capacity (memory) / max buffered records (kafka) |
+| `BATCH_SIZE` | `1000` | Events per database write |
+| `FLUSH_INTERVAL` | `200ms` | Max wait before a partial batch is written |
+| `WORKERS` | `4` | Worker goroutines (memory mode) |
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated brokers |
+| `KAFKA_TOPIC` / `KAFKA_GROUP` | `tally.events` / `tally-workers` | Topic and consumer group |
+| `RATE_LIMIT_RPS` | `0` (off) | Per-client events/sec (`X-API-Key` or IP) |
+| `RATE_LIMIT_BURST` | `2×RPS` | Burst allowance (in-memory limiter) |
+| `REDIS_ADDR` | `""` | Set to enforce the rate limit globally across instances |
 
 ---
+
+## Architecture notes (technical)
+
+- **Ingest** ([internal/ingest](internal/ingest)) — validates, rate-limits, enqueues, returns. Never blocks on Postgres.
+- **Queue** ([internal/queue](internal/queue)) — bounded channel, or Kafka producer/consumer (franz-go) behind the same `Enqueue` contract. Full queue → `ErrFull` → `503 Retry-After`.
+- **Workers** ([internal/worker](internal/worker)) — size-or-time batching, bounded retries with backoff, partial-batch flush on shutdown. In kafka mode the consumer commits offsets only post-insert.
+- **Store** ([internal/store](internal/store)) — one CTE does insert + dedupe + rollup atomically; counts derive from actually-inserted rows only.
+- **Shutdown ordering** — stop HTTP → drain queue → flush workers → close pool. Accepted events always land.
+- **Design decisions** — written up as ADRs in [docs/adr/](docs/adr): the queue-in-the-middle, delivery semantics ("exactly-once is a lie"), and the rate-limit/backpressure split.
 
 ## Benchmarks
 
-_Coming in Phase 3._ Will include throughput (events/sec) and p50/p99 latency, before/after each optimization, with pprof flame graphs. See [BENCHMARKS.md](BENCHMARKS.md).
+Methodology, profiling instructions, and result tables live in [BENCHMARKS.md](BENCHMARKS.md). Numbers get published only after they're measured on real hardware — accepted-vs-stored must reconcile to zero loss for a run to count.
 
----
+## Deploying
 
-## Design decisions
-
-Written up as short ADRs in [`docs/adr/`](docs/adr/): queue choice, delivery semantics, and database schema.
-
----
+- **Docker:** `make docker` (multi-stage build, distroless, ~20 MB).
+- **Kubernetes:** manifests + walkthrough in [deploy/k8s](deploy/k8s).
 
 ## Roadmap
 
-- [x] **Phase 0** — Receive an event → save straight to Postgres → query it. (walking skeleton)
-- [ ] **Phase 1** — Add the queue, batching workers, graceful shutdown, idempotency.
-- [ ] **Phase 2** — Real message broker; make it survive restarts.
-- [ ] **Phase 3** — Load tests + published benchmarks + a "kill a worker, lose nothing" chaos demo.
-- [ ] **Phase 4** — Dashboard, rate limiting, Prometheus/Grafana, Kubernetes deploy.
-
----
+- [x] **Phase 0** — walking skeleton: receive → store → query
+- [x] **Phase 1** — queue, batching workers, atomic rollups, graceful drain, backpressure
+- [x] **Phase 2** — durable queue (Redpanda), split ingest/worker, chaos script
+- [ ] **Phase 3** — publish measured benchmarks + flame graphs + chaos results ([tooling ready](BENCHMARKS.md))
+- [x] **Phase 4** — rate limiting, metrics + Grafana, live dashboard, Docker/k8s/CI
+- [ ] **Later** — gRPC ingest, ClickHouse for heavy aggregation, HyperLogLog uniques
 
 ## License
 

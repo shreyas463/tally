@@ -1,0 +1,57 @@
+# Dev-cluster Postgres. In production, use a managed database and delete this.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgdata
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER, value: tally }
+            - { name: POSTGRES_PASSWORD, value: tally }
+            - { name: POSTGRES_DB, value: tally }
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - { name: pgdata, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, tally]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: pgdata
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432

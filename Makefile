@@ -1,7 +1,7 @@
-.PHONY: help setup up down migrate run build loadtest test fmt
+.PHONY: help setup up down kafka-up obs-up migrate run run-kafka run-ingest run-worker build docker loadtest chaos test fmt
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-11s\033[0m %s\n", $$1, $$2}'
 
 setup: ## Download Go dependencies
 	go mod tidy
@@ -9,8 +9,15 @@ setup: ## Download Go dependencies
 up: ## Start Postgres + Redis (Docker)
 	docker compose up -d
 
-down: ## Stop and remove containers
-	docker compose down
+kafka-up: ## Start Postgres + Redis + Redpanda (durable queue)
+	docker compose --profile kafka up -d
+
+obs-up: ## Start Prometheus + Grafana (metrics stack)
+	docker compose --profile obs up -d
+	@echo "Prometheus: http://localhost:9090   Grafana: http://localhost:3000"
+
+down: ## Stop and remove all containers
+	docker compose --profile kafka --profile obs down
 
 migrate: ## Apply all database migrations (idempotent)
 	@for f in migrations/*.sql; do \
@@ -18,17 +25,32 @@ migrate: ## Apply all database migrations (idempotent)
 		docker compose exec -T postgres psql -U tally -d tally -v ON_ERROR_STOP=1 < $$f; \
 	done
 
-run: ## Run the Tally service
+run: ## Run Tally (in-memory queue)
 	go run ./cmd/tally
+
+run-kafka: ## Run Tally with the durable queue (needs kafka-up)
+	QUEUE=kafka go run ./cmd/tally
+
+run-ingest: ## Run an ingest-only instance on :8080 (needs kafka-up)
+	QUEUE=kafka MODE=ingest go run ./cmd/tally
+
+run-worker: ## Run a worker-only instance on :8081 (needs kafka-up)
+	QUEUE=kafka MODE=worker ADDR=:8081 go run ./cmd/tally
 
 build: ## Build binaries into ./bin
 	go build -o bin/tally ./cmd/tally
 	go build -o bin/loadgen ./cmd/loadgen
 
-loadtest: ## Fire fake traffic with the Go generator
+docker: ## Build the Docker image
+	docker build -t tally:local .
+
+loadtest: ## Fire fake traffic with the Go generator (see also loadtest/ingest.js for k6)
 	go run ./cmd/loadgen -rate 2000 -duration 10s
 
-test: ## Run tests
+chaos: ## Kill a worker mid-batch and prove nothing is lost (needs kafka-up + build)
+	./scripts/chaos.sh
+
+test: ## Run tests with the race detector
 	go test -race ./...
 
 fmt: ## Format code
