@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -26,8 +27,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
 
 	"github.com/shreyas463/tally/internal/dashboard"
+	"github.com/shreyas463/tally/internal/grpcingest"
 	"github.com/shreyas463/tally/internal/ingest"
 	"github.com/shreyas463/tally/internal/metrics"
 	"github.com/shreyas463/tally/internal/queue"
@@ -38,6 +41,7 @@ import (
 
 type config struct {
 	addr          string
+	grpcAddr      string // "" disables the gRPC listener
 	databaseURL   string
 	queueBackend  string // memory | kafka
 	mode          string // all | ingest | worker  (kafka only)
@@ -56,6 +60,7 @@ type config struct {
 func loadConfig() config {
 	cfg := config{
 		addr:          getenv("ADDR", ":8080"),
+		grpcAddr:      getenv("GRPC_ADDR", ":9091"),
 		databaseURL:   getenv("DATABASE_URL", "postgres://tally:tally@localhost:5432/tally?sslmode=disable"),
 		queueBackend:  getenv("QUEUE", "memory"),
 		mode:          getenv("MODE", "all"),
@@ -205,6 +210,25 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
+	// gRPC ingest — second front door, same queue and limiter. Only started
+	// on instances that accept events; "" disables it entirely.
+	var grpcSrv *grpc.Server
+	acceptsEvents := cfg.queueBackend == "memory" || cfg.mode == "all" || cfg.mode == "ingest"
+	if cfg.grpcAddr != "" && acceptsEvents {
+		lis, err := net.Listen("tcp", cfg.grpcAddr)
+		if err != nil {
+			log.Fatalf("grpc listen on %s: %v", cfg.grpcAddr, err)
+		}
+		grpcSrv = grpc.NewServer()
+		grpcingest.New(enq, limiter).Register(grpcSrv)
+		go func() {
+			log.Printf("tally grpc listening on %s", cfg.grpcAddr)
+			if err := grpcSrv.Serve(lis); err != nil {
+				log.Printf("grpc server stopped: %v", err)
+			}
+		}()
+	}
+
 	go func() {
 		log.Printf("tally listening on %s (queue=%s mode=%s batch=%d flush=%s workers=%d)",
 			cfg.addr, cfg.queueBackend, cfg.mode, cfg.batchSize, cfg.flushInterval, cfg.workers)
@@ -228,6 +252,9 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful http shutdown failed: %v", err)
+	}
+	if grpcSrv != nil {
+		grpcSrv.GracefulStop() // in-flight RPCs finish; no new ones accepted
 	}
 
 	for _, fn := range shutdownFns {

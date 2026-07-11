@@ -1,4 +1,4 @@
-.PHONY: help setup up down kafka-up obs-up migrate run run-kafka run-ingest run-worker build docker loadtest chaos test fmt
+.PHONY: help setup up down kafka-up obs-up migrate run run-kafka run-ingest run-worker build docker proto loadtest chaos test fmt
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-11s\033[0m %s\n", $$1, $$2}'
@@ -51,6 +51,13 @@ loadtest: ## Fire fake traffic with the Go generator (see also loadtest/ingest.j
 
 chaos: ## Kill a worker mid-batch and prove nothing is lost (needs kafka-up + build)
 	./scripts/chaos.sh
+
+proto: ## Regenerate gRPC code from proto/ (needs protoc + Go plugins)
+	PATH="$$PATH:$$(go env GOPATH)/bin" protoc \
+		--proto_path=proto \
+		--go_out=gen --go_opt=paths=source_relative \
+		--go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+		proto/tally/v1/tally.proto
 
 test: ## Run tests with the race detector
 	go test -race ./...

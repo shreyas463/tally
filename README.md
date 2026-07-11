@@ -127,6 +127,7 @@ make obs-up                    # Prometheus :9090 + Grafana :3000 (dashboard pre
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/events` | Ingest one event: `{event_id, name, distinct_id, properties?}` → `202`, `429` (over your rate limit), or `503` (backpressure) |
+| gRPC | `tally.v1.TallyService/Publish` (`:9091`) | Batch ingest for backend SDKs — many events per call, same queue/limits; contract in [proto/tally/v1](proto/tally/v1/tally.proto) |
 | `GET` | `/v1/counts?event=NAME` | Today's count for one event name |
 | `GET` | `/v1/uniques?event=NAME` | Today's unique-user estimate for one event (HyperLogLog, ~1% error) |
 | `GET` | `/v1/stats` | Today's totals + unique-user estimates per name + last-15-min series |
@@ -139,7 +140,8 @@ make obs-up                    # Prometheus :9090 + Grafana :3000 (dashboard pre
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ADDR` | `:8080` | Listen address |
+| `ADDR` | `:8080` | HTTP listen address |
+| `GRPC_ADDR` | `:9091` | gRPC listen address (`""` disables; only on instances that accept events) |
 | `DATABASE_URL` | local dev DSN | Postgres connection string |
 | `QUEUE` | `memory` | `memory` or `kafka` |
 | `MODE` | `all` | `all`, `ingest`, or `worker` (kafka only) |
@@ -182,7 +184,8 @@ Methodology, profiling instructions, and result tables live in [BENCHMARKS.md](B
 - [ ] **Phase 3** — publish measured benchmarks + flame graphs + chaos results ([tooling ready](BENCHMARKS.md))
 - [x] **Phase 4** — rate limiting, metrics + Grafana, live dashboard, Docker/k8s/CI
 - [x] **Phase 5** — unique-user counting via from-scratch HyperLogLog (verified at 0.85% error vs exact)
-- [ ] **Later** — gRPC ingest, ClickHouse for heavy aggregation, weekly/monthly unique rollups (sketches already merge)
+- [x] **Phase 6** — gRPC batch-ingest endpoint alongside HTTP (same queue, limits, and idempotency)
+- [ ] **Later** — ClickHouse for heavy aggregation, weekly/monthly unique rollups (sketches already merge)
 
 ## License
 

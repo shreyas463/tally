@@ -1,0 +1,53 @@
+// Tally's gRPC ingest surface.
+//
+// Why gRPC next to HTTP: backend SDKs sending events at volume benefit from
+// batching many events into one call over a multiplexed HTTP/2 connection
+// with a typed, versioned contract. The HTTP JSON API remains the simple
+// integration path (curl, browsers, webhooks); both feed the same queue with
+// the same idempotency and backpressure semantics.
+syntax = "proto3";
+
+package tally.v1;
+
+option go_package = "github.com/shreyas463/tally/gen/tallypb";
+
+service TallyService {
+  // Publish enqueues a batch of events in one call. Per-event validation
+  // failures are reported in the response (the valid remainder is still
+  // accepted); a full queue fails the whole call with RESOURCE_EXHAUSTED so
+  // clients back off and retry the batch — the gRPC twin of HTTP's
+  // 503 + Retry-After. Duplicate event_ids are accepted here and deduped at
+  // storage, exactly like the HTTP path.
+  rpc Publish(PublishRequest) returns (PublishResponse);
+}
+
+message Event {
+  // Unique id for exactly-once counting; duplicates are deduped at storage.
+  string event_id = 1;
+  // What happened, e.g. "buy_click".
+  string name = 2;
+  // Who did it, e.g. "user_42". Optional; empty events are excluded from
+  // unique-user counts but still tallied.
+  string distinct_id = 3;
+  // Optional extra details. String-valued by design — analytics properties
+  // overwhelmingly are, and it keeps the wire contract simple.
+  map<string, string> properties = 4;
+}
+
+message PublishRequest {
+  repeated Event events = 1;
+}
+
+message PublishResponse {
+  // Events enqueued.
+  int32 accepted = 1;
+  // Events rejected by validation (missing event_id or name), with reasons
+  // indexed back into the request.
+  repeated RejectedEvent rejected = 2;
+}
+
+message RejectedEvent {
+  // Index into PublishRequest.events.
+  int32 index = 1;
+  string reason = 2;
+}
