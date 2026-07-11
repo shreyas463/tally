@@ -5,6 +5,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -37,17 +39,29 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
-// New connects to Postgres and verifies the connection works.
+// New connects to Postgres and verifies the connection works. Because
+// Postgres may still be starting up (common under Docker/Kubernetes), it
+// retries the first connection for up to ~30s instead of failing instantly.
 func New(ctx context.Context, dsn string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, err
+	var lastErr error
+	for attempt := 1; attempt <= 30; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		lastErr = pool.Ping(pingCtx)
+		cancel()
+		if lastErr == nil {
+			return &Store{pool: pool}, nil
+		}
+		if attempt == 1 {
+			log.Printf("store: waiting for postgres to become ready...")
+		}
+		time.Sleep(time.Second)
 	}
-	return &Store{pool: pool}, nil
+	pool.Close()
+	return nil, fmt.Errorf("postgres not reachable after retries: %w", lastErr)
 }
 
 // Close releases all database connections.

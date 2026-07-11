@@ -6,8 +6,8 @@ help: ## Show this help
 setup: ## Download Go dependencies
 	go mod tidy
 
-up: ## Start Postgres + Redis (Docker)
-	docker compose up -d
+up: ## Start Postgres + Redis (Docker), waiting until healthy
+	docker compose up -d --wait
 
 kafka-up: ## Start Postgres + Redis + Redpanda (durable queue)
 	docker compose --profile kafka up -d
@@ -20,6 +20,8 @@ down: ## Stop and remove all containers
 	docker compose --profile kafka --profile obs down
 
 migrate: ## Apply all database migrations (idempotent)
+	@echo "waiting for postgres to be ready..."
+	@until docker compose exec -T postgres psql -U tally -d tally -c 'SELECT 1' >/dev/null 2>&1; do sleep 1; done
 	@for f in migrations/*.sql; do \
 		echo "applying $$f"; \
 		docker compose exec -T postgres psql -U tally -d tally -v ON_ERROR_STOP=1 < $$f; \

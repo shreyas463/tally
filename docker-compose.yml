@@ -12,10 +12,13 @@ services:
       # SQL files here run automatically the first time the DB is created.
       - ./migrations:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tally"]
-      interval: 5s
+      # A real query — only passes once the tally DB exists AND accepts
+      # connections, so `--wait` and the migrate step never race first boot.
+      test: ["CMD-SHELL", "psql -U tally -d tally -c 'SELECT 1' || exit 1"]
+      interval: 3s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 5s
 
   redis:
     image: redis:7
