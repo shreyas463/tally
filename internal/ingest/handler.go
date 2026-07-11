@@ -30,6 +30,8 @@ type StatsStore interface {
 	CountToday(ctx context.Context, name string) (int64, error)
 	TotalsToday(ctx context.Context) ([]store.NameCount, error)
 	Series(ctx context.Context, window time.Duration) ([]store.MinutePoint, error)
+	UniquesToday(ctx context.Context, name string) (uint64, error)
+	UniquesTodayAll(ctx context.Context) ([]store.NameCount, error)
 }
 
 // Handler wires the HTTP routes to the queue (writes) and store (reads).
@@ -48,6 +50,7 @@ func New(q Enqueuer, s StatsStore, l ratelimit.Limiter) *Handler {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/events", h.postEvent)
 	mux.HandleFunc("GET /v1/counts", h.getCount)
+	mux.HandleFunc("GET /v1/uniques", h.getUniques)
 	mux.HandleFunc("GET /v1/stats", h.getStats)
 	mux.HandleFunc("GET /healthz", h.health)
 }
@@ -135,12 +138,33 @@ func (h *Handler) getCount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"event": name, "count_today": n})
 }
 
-// getStats returns today's totals plus a recent per-minute series — the data
-// behind the live dashboard.
+// getUniques answers "how many DIFFERENT users did <event> today?" —
+// estimated by a HyperLogLog sketch (~1% error), not an exact count.
+func (h *Handler) getUniques(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("event")
+	if name == "" {
+		http.Error(w, "the 'event' query parameter is required", http.StatusBadRequest)
+		return
+	}
+	n, err := h.stats.UniquesToday(r.Context(), name)
+	if err != nil {
+		http.Error(w, "failed to query uniques", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"event": name, "unique_users_today": n})
+}
+
+// getStats returns today's totals, unique-user estimates, and a recent
+// per-minute series — the data behind the live dashboard.
 func (h *Handler) getStats(w http.ResponseWriter, r *http.Request) {
 	totals, err := h.stats.TotalsToday(r.Context())
 	if err != nil {
 		http.Error(w, "failed to query totals", http.StatusInternalServerError)
+		return
+	}
+	uniques, err := h.stats.UniquesTodayAll(r.Context())
+	if err != nil {
+		http.Error(w, "failed to query uniques", http.StatusInternalServerError)
 		return
 	}
 	series, err := h.stats.Series(r.Context(), 15*time.Minute)
@@ -149,8 +173,9 @@ func (h *Handler) getStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"totals_today": totals,
-		"series":       series,
+		"totals_today":  totals,
+		"uniques_today": uniques,
+		"series":        series,
 	})
 }
 

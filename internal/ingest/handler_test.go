@@ -25,7 +25,10 @@ func (f *fakeQueue) Enqueue(e store.Event) error {
 	return nil
 }
 
-type fakeStats struct{ count int64 }
+type fakeStats struct {
+	count   int64
+	uniques uint64
+}
 
 func (f *fakeStats) CountToday(context.Context, string) (int64, error) { return f.count, nil }
 func (f *fakeStats) TotalsToday(context.Context) ([]store.NameCount, error) {
@@ -33,6 +36,10 @@ func (f *fakeStats) TotalsToday(context.Context) ([]store.NameCount, error) {
 }
 func (f *fakeStats) Series(context.Context, time.Duration) ([]store.MinutePoint, error) {
 	return []store.MinutePoint{}, nil
+}
+func (f *fakeStats) UniquesToday(context.Context, string) (uint64, error) { return f.uniques, nil }
+func (f *fakeStats) UniquesTodayAll(context.Context) ([]store.NameCount, error) {
+	return []store.NameCount{{Name: "buy_click", Count: int64(f.uniques)}}, nil
 }
 
 func newServer(q Enqueuer, s StatsStore) *httptest.Server {
@@ -146,6 +153,30 @@ func TestGetCountRequiresEventParam(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestGetUniques(t *testing.T) {
+	srv := newServer(&fakeQueue{}, &fakeStats{uniques: 1234})
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/uniques?event=buy_click")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Missing the event param must 400.
+	resp2, err := http.Get(srv.URL + "/v1/uniques")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 without event param", resp2.StatusCode)
 	}
 }
 

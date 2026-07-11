@@ -5,11 +5,16 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shreyas463/tally/internal/hll"
 )
 
 // Event is one thing that happened — a click, a view, a purchase.
@@ -142,11 +147,155 @@ func (s *Store) InsertBatch(ctx context.Context, events []Event) (int64, error) 
 		timestamps[i] = e.TS
 	}
 
+	// One transaction covers the event insert + rollups (the CTE) AND the
+	// unique-user sketches, so a crash can never leave the two disagreeing.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var inserted int64
-	err := s.pool.QueryRow(ctx, insertBatchSQL,
+	if err := tx.QueryRow(ctx, insertBatchSQL,
 		ids, names, distinctIDs, props, timestamps,
-	).Scan(&inserted)
-	return inserted, err
+	).Scan(&inserted); err != nil {
+		return 0, err
+	}
+
+	if err := updateUniques(ctx, tx, events); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return inserted, nil
+}
+
+// uniqueKey identifies one sketch row: an event name on a UTC day.
+type uniqueKey struct {
+	name string
+	day  string // YYYY-MM-DD
+}
+
+// updateUniques folds the batch's distinct_ids into the per-(name, day)
+// HyperLogLog sketches.
+//
+// Concurrency pattern (each step matters):
+//  1. ensure the row exists (INSERT .. DO NOTHING) — otherwise two
+//     transactions could both see "no row", both insert-or-update, and one
+//     sketch would silently overwrite the other (lost update);
+//  2. SELECT .. FOR UPDATE to take the row lock;
+//  3. merge in Go, write back with a plain UPDATE.
+//
+// Keys are processed in sorted order so concurrent batches always take row
+// locks in the same order — same deadlock-avoidance rule the batch insert
+// itself follows (see the ORDER BY comments in insertBatchSQL).
+func updateUniques(ctx context.Context, tx pgx.Tx, events []Event) error {
+	groups := make(map[uniqueKey][]string)
+	for _, e := range events {
+		if e.DistinctID == "" {
+			continue // no user attached to this event
+		}
+		k := uniqueKey{name: e.Name, day: e.TS.UTC().Format("2006-01-02")}
+		groups[k] = append(groups[k], e.DistinctID)
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+
+	keys := make([]uniqueKey, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].name != keys[j].name {
+			return keys[i].name < keys[j].name
+		}
+		return keys[i].day < keys[j].day
+	})
+
+	empty := hll.New().Bytes()
+	for _, k := range keys {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO event_uniques_day (name, day, sketch) VALUES ($1, $2::date, $3)
+			 ON CONFLICT (name, day) DO NOTHING`,
+			k.name, k.day, empty,
+		); err != nil {
+			return err
+		}
+
+		var raw []byte
+		if err := tx.QueryRow(ctx,
+			`SELECT sketch FROM event_uniques_day WHERE name = $1 AND day = $2::date FOR UPDATE`,
+			k.name, k.day,
+		).Scan(&raw); err != nil {
+			return err
+		}
+		sketch, err := hll.FromBytes(raw)
+		if err != nil {
+			return fmt.Errorf("corrupt sketch for %s/%s: %w", k.name, k.day, err)
+		}
+
+		for _, id := range groups[k] {
+			sketch.Add(id)
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE event_uniques_day SET sketch = $3 WHERE name = $1 AND day = $2::date`,
+			k.name, k.day, sketch.Bytes(),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UniquesToday estimates how many distinct users produced the named event
+// today (UTC). Returns 0 when the event hasn't been seen today.
+func (s *Store) UniquesToday(ctx context.Context, name string) (uint64, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT sketch FROM event_uniques_day WHERE name = $1 AND day = current_date`,
+		name,
+	).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	sketch, err := hll.FromBytes(raw)
+	if err != nil {
+		return 0, err
+	}
+	return sketch.Estimate(), nil
+}
+
+// UniquesTodayAll returns today's unique-user estimate for every event name.
+func (s *Store) UniquesTodayAll(ctx context.Context) ([]NameCount, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT name, sketch FROM event_uniques_day WHERE day = current_date`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []NameCount{}
+	for rows.Next() {
+		var name string
+		var raw []byte
+		if err := rows.Scan(&name, &raw); err != nil {
+			return nil, err
+		}
+		sketch, err := hll.FromBytes(raw)
+		if err != nil {
+			return nil, fmt.Errorf("corrupt sketch for %s: %w", name, err)
+		}
+		out = append(out, NameCount{Name: name, Count: int64(sketch.Estimate())})
+	}
+	return out, rows.Err()
 }
 
 // CountToday returns how many events with the given name happened today (UTC),

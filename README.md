@@ -33,6 +33,7 @@ Messages pour **in**, totals come **out**. The reason this is a whole project �
 - **Loses nothing** — graceful shutdown drains every accepted event; in durable mode, even a `SIGKILL`ed worker loses zero events (there's a [script that proves it](scripts/chaos.sh)).
 - **Never double-counts** — every write is idempotent; retries, crashes, and duplicate sends can't inflate a number.
 - **Instant answers** — per-minute rollups make "how many today?" a summation over a few hundred rows, not a scan over millions.
+- **Unique users, at scale** — "how many *different* people did X today?" answered by a from-scratch [HyperLogLog](internal/hll) (~16 KB per event/day, ~1% error, verified live at 0.85% against exact counts).
 - **Protects itself** — per-client rate limits (429) and queue-full backpressure (503 + Retry-After) instead of falling over.
 - **Observable** — Prometheus metrics, pprof profiling, a provisioned Grafana dashboard, and a built-in live dashboard at `/`.
 - **Honest numbers** — [BENCHMARKS.md](BENCHMARKS.md) publishes measured results only, with the methodology to reproduce them.
@@ -127,7 +128,8 @@ make obs-up                    # Prometheus :9090 + Grafana :3000 (dashboard pre
 |---|---|---|
 | `POST` | `/v1/events` | Ingest one event: `{event_id, name, distinct_id, properties?}` → `202`, `429` (over your rate limit), or `503` (backpressure) |
 | `GET` | `/v1/counts?event=NAME` | Today's count for one event name |
-| `GET` | `/v1/stats` | Today's totals per name + last-15-min per-minute series |
+| `GET` | `/v1/uniques?event=NAME` | Today's unique-user estimate for one event (HyperLogLog, ~1% error) |
+| `GET` | `/v1/stats` | Today's totals + unique-user estimates per name + last-15-min series |
 | `GET` | `/` | Built-in live dashboard |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/healthz` | Liveness |
@@ -158,7 +160,8 @@ make obs-up                    # Prometheus :9090 + Grafana :3000 (dashboard pre
 - **Ingest** ([internal/ingest](internal/ingest)) — validates, rate-limits, enqueues, returns. Never blocks on Postgres.
 - **Queue** ([internal/queue](internal/queue)) — bounded channel, or Kafka producer/consumer (franz-go) behind the same `Enqueue` contract. Full queue → `ErrFull` → `503 Retry-After`.
 - **Workers** ([internal/worker](internal/worker)) — size-or-time batching, bounded retries with backoff, partial-batch flush on shutdown. In kafka mode the consumer commits offsets only post-insert.
-- **Store** ([internal/store](internal/store)) — one CTE does insert + dedupe + rollup atomically; counts derive from actually-inserted rows only.
+- **Store** ([internal/store](internal/store)) — one CTE does insert + dedupe + rollup atomically; counts derive from actually-inserted rows only. Unique-user sketches update in the same transaction (insert-then-lock upsert, sorted lock order — a shape chosen after a load test surfaced a real deadlock).
+- **HLL** ([internal/hll](internal/hll)) — HyperLogLog implemented from scratch (~100 lines), accuracy-tested from 10² to 10⁶ distinct values; see [ADR 0005](docs/adr/0005-hyperloglog-unique-users.md).
 - **Shutdown ordering** — stop HTTP → drain queue → flush workers → close pool. Accepted events always land.
 - **Design decisions** — written up as ADRs in [docs/adr/](docs/adr): the queue-in-the-middle, delivery semantics ("exactly-once is a lie"), and the rate-limit/backpressure split.
 
@@ -178,7 +181,8 @@ Methodology, profiling instructions, and result tables live in [BENCHMARKS.md](B
 - [x] **Phase 2** — durable queue (Redpanda), split ingest/worker, chaos script
 - [ ] **Phase 3** — publish measured benchmarks + flame graphs + chaos results ([tooling ready](BENCHMARKS.md))
 - [x] **Phase 4** — rate limiting, metrics + Grafana, live dashboard, Docker/k8s/CI
-- [ ] **Later** — gRPC ingest, ClickHouse for heavy aggregation, HyperLogLog uniques
+- [x] **Phase 5** — unique-user counting via from-scratch HyperLogLog (verified at 0.85% error vs exact)
+- [ ] **Later** — gRPC ingest, ClickHouse for heavy aggregation, weekly/monthly unique rollups (sketches already merge)
 
 ## License
 
