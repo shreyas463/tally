@@ -12,8 +12,11 @@ up: ## Start Postgres + Redis (Docker)
 down: ## Stop and remove containers
 	docker compose down
 
-migrate: ## Create the database tables
-	docker compose exec -T postgres psql -U tally -d tally < migrations/001_init.sql
+migrate: ## Apply all database migrations (idempotent)
+	@for f in migrations/*.sql; do \
+		echo "applying $$f"; \
+		docker compose exec -T postgres psql -U tally -d tally -v ON_ERROR_STOP=1 < $$f; \
+	done
 
 run: ## Run the Tally service
 	go run ./cmd/tally
