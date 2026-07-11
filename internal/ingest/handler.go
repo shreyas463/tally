@@ -16,6 +16,7 @@ import (
 
 	"github.com/shreyas463/tally/internal/metrics"
 	"github.com/shreyas463/tally/internal/queue"
+	"github.com/shreyas463/tally/internal/ratelimit"
 	"github.com/shreyas463/tally/internal/store"
 )
 
@@ -33,12 +34,15 @@ type StatsStore interface {
 
 // Handler wires the HTTP routes to the queue (writes) and store (reads).
 type Handler struct {
-	queue Enqueuer
-	stats StatsStore
+	queue   Enqueuer
+	stats   StatsStore
+	limiter ratelimit.Limiter // nil = rate limiting disabled
 }
 
-// New builds a Handler.
-func New(q Enqueuer, s StatsStore) *Handler { return &Handler{queue: q, stats: s} }
+// New builds a Handler. Pass a nil limiter to disable rate limiting.
+func New(q Enqueuer, s StatsStore, l ratelimit.Limiter) *Handler {
+	return &Handler{queue: q, stats: s, limiter: l}
+}
 
 // Register attaches Tally's routes to the given mux.
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -58,6 +62,15 @@ type eventRequest struct {
 // postEvent receives one event, validates it, and queues it.
 func (h *Handler) postEvent(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Rate limit first — the cheapest possible rejection for a hot client.
+	if h.limiter != nil && !h.limiter.Allow(ratelimit.ClientKey(r)) {
+		metrics.EventsRejected.WithLabelValues("rate_limited").Inc()
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB cap
 
 	var req eventRequest

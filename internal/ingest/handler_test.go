@@ -37,8 +37,28 @@ func (f *fakeStats) Series(context.Context, time.Duration) ([]store.MinutePoint,
 
 func newServer(q Enqueuer, s StatsStore) *httptest.Server {
 	mux := http.NewServeMux()
-	New(q, s).Register(mux)
+	New(q, s, nil).Register(mux)
 	return httptest.NewServer(mux)
+}
+
+// denyAll is a Limiter that rejects everything.
+type denyAll struct{}
+
+func (denyAll) Allow(string) bool { return false }
+
+func TestPostEventRateLimited(t *testing.T) {
+	mux := http.NewServeMux()
+	New(&fakeQueue{}, &fakeStats{}, denyAll{}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp := post(t, srv.URL, `{"event_id":"e1","name":"x"}`)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 when rate limited", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("429 must carry a Retry-After header")
+	}
 }
 
 func post(t *testing.T, url, body string) *http.Response {

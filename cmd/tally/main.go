@@ -31,6 +31,7 @@ import (
 	"github.com/shreyas463/tally/internal/ingest"
 	"github.com/shreyas463/tally/internal/metrics"
 	"github.com/shreyas463/tally/internal/queue"
+	"github.com/shreyas463/tally/internal/ratelimit"
 	"github.com/shreyas463/tally/internal/store"
 	"github.com/shreyas463/tally/internal/worker"
 )
@@ -47,6 +48,9 @@ type config struct {
 	kafkaBrokers  []string
 	kafkaTopic    string
 	kafkaGroup    string
+	rateRPS       int
+	rateBurst     int
+	redisAddr     string
 }
 
 func loadConfig() config {
@@ -62,6 +66,12 @@ func loadConfig() config {
 		kafkaBrokers:  strings.Split(getenv("KAFKA_BROKERS", "localhost:9092"), ","),
 		kafkaTopic:    getenv("KAFKA_TOPIC", "tally.events"),
 		kafkaGroup:    getenv("KAFKA_GROUP", "tally-workers"),
+		rateRPS:       getenvInt("RATE_LIMIT_RPS", 0), // 0 = disabled
+		rateBurst:     getenvInt("RATE_LIMIT_BURST", 0),
+		redisAddr:     getenv("REDIS_ADDR", ""),
+	}
+	if cfg.rateBurst == 0 {
+		cfg.rateBurst = 2 * cfg.rateRPS
 	}
 	if cfg.queueBackend != "memory" && cfg.queueBackend != "kafka" {
 		log.Fatalf("QUEUE must be 'memory' or 'kafka', got %q", cfg.queueBackend)
@@ -159,9 +169,27 @@ func main() {
 		}
 	}
 
+	// Rate limiting (RATE_LIMIT_RPS=0 disables). With REDIS_ADDR set the
+	// limit is enforced globally across every ingest instance; otherwise
+	// per-instance token buckets.
+	var limiter ratelimit.Limiter
+	if cfg.rateRPS > 0 {
+		if cfg.redisAddr != "" {
+			rl, err := ratelimit.NewRedis(cfg.redisAddr, cfg.rateRPS)
+			if err != nil {
+				log.Fatalf("connecting redis rate limiter: %v", err)
+			}
+			limiter = rl
+			log.Printf("rate limiting: %d events/sec per key (redis, global)", cfg.rateRPS)
+		} else {
+			limiter = ratelimit.NewMemory(float64(cfg.rateRPS), cfg.rateBurst)
+			log.Printf("rate limiting: %d events/sec per key, burst %d (in-memory)", cfg.rateRPS, cfg.rateBurst)
+		}
+	}
+
 	// HTTP surface (all modes serve queries, metrics, dashboard).
 	mux := http.NewServeMux()
-	ingest.New(enq, st).Register(mux)
+	ingest.New(enq, st, limiter).Register(mux)
 	dashboard.Register(mux)
 	mux.Handle("GET /metrics", promhttp.Handler())
 	// pprof, for profiling under load (see BENCHMARKS.md). The Index handler
