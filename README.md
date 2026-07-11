@@ -8,8 +8,9 @@ Tally swallows a firehose of "this happened" events (clicks, views, purchases), 
 ![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-<!-- Demo gif goes here once recorded (see docs/media/README.md) -->
-<!-- ![Tally handling a live load test](docs/media/demo.gif) -->
+<!-- Hero demo — record per docs/media/README.md, then uncomment:
+![Tally: the live dashboard updating while a load test runs](docs/media/dashboard.gif)
+-->
 
 ---
 
@@ -38,6 +39,10 @@ Messages pour **in**, totals come **out**. The reason this is a whole project �
 - **Observable** — Prometheus metrics, pprof profiling, a provisioned Grafana dashboard, and a built-in live dashboard at `/`.
 - **Honest numbers** — [BENCHMARKS.md](BENCHMARKS.md) publishes measured results only, with the methodology to reproduce them.
 
+**Unique-count accuracy** — the from-scratch HyperLogLog run against exact truth from 100 to 1,000,000 distinct users. Error stays near the ~0.8% theoretical bound the whole way (chart generated from [`internal/hll`](internal/hll); the same accuracy is asserted by its test suite):
+
+![HyperLogLog estimate vs exact counts, 100 to 1M distinct users, error under ~1%](docs/media/hll-accuracy.svg)
+
 ---
 
 ## How it works (the journey of one event)
@@ -57,6 +62,25 @@ flowchart LR
 3. Each batch lands in **one atomic SQL statement** that inserts the raw events, skips duplicates, and increments per-minute rollup counters — counting only rows that were *actually* inserted, so a replayed batch can't double-count.
 4. The **dashboard and query API** read the rollups for instant answers.
 
+The same journey as a sequence — notice the `202` returns *before* anything is written:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your app
+    participant API as Ingest API
+    participant Q as Queue
+    participant W as Worker pool
+    participant PG as Postgres
+    App->>API: POST /v1/events (or gRPC Publish)
+    API->>Q: enqueue
+    API-->>App: 202 Accepted — immediately
+    Note over Q,W: asynchronously, in batches<br/>(1,000 events or every 200ms)
+    W->>Q: pull a batch
+    W->>PG: one transaction — insert + dedupe + rollup + HLL
+    PG-->>W: committed → counted exactly once
+```
+
 ### Two queue backends
 
 | | `QUEUE=memory` (default) | `QUEUE=kafka` |
@@ -67,6 +91,48 @@ flowchart LR
 | Scale shape | One process | `MODE=ingest` / `MODE=worker` run and scale as separate processes |
 
 That "commit only after storing, dedupe on replay" pair is the classic **at-least-once delivery + idempotent consumer** pattern — [ADR 0003](docs/adr/0003-durable-queue-and-crash-safety.md) explains it and its honest limits.
+
+**Durable mode, drawn out** — ingest and workers become separate processes that scale independently around the broker:
+
+```mermaid
+flowchart TB
+    C["App / SDK"]
+    subgraph ingest ["Ingest processes — scale with traffic"]
+        I1["tally MODE=ingest"]
+        I2["tally MODE=ingest"]
+    end
+    subgraph broker ["Redpanda (Kafka API)"]
+        T[("topic: tally.events")]
+    end
+    subgraph workers ["Worker processes — scale with write load"]
+        W1["tally MODE=worker"]
+        W2["tally MODE=worker"]
+    end
+    PG[("Postgres")]
+    C -->|HTTP / gRPC| I1
+    C -->|HTTP / gRPC| I2
+    I1 -->|produce| T
+    I2 -->|produce| T
+    T -->|consume in batches| W1
+    T -->|consume in batches| W2
+    W1 -->|insert + rollup + HLL| PG
+    W2 -->|insert + rollup + HLL| PG
+```
+
+---
+
+## Demo
+
+> _Screen recordings go in [`docs/media/`](docs/media/README.md). To capture them (~5 min): run the app, record with [Kap](https://getkap.co) (free), drop the files in `docs/media/`, and uncomment the images below._
+
+**1. Live dashboard** — totals and the per-minute chart moving in real time as events arrive.
+<!-- ![Live dashboard](docs/media/dashboard.gif) -->
+
+**2. Load test** — thousands of events/sec via k6, with latency percentiles printed live.
+<!-- ![Load test](docs/media/loadtest.gif) -->
+
+**3. Zero-loss chaos** — a worker is `SIGKILL`ed mid-batch; the final count is still exact.
+<!-- ![Chaos: zero loss](docs/media/chaos.gif) -->
 
 ---
 
