@@ -99,6 +99,9 @@ func (h *Handler) postEvent(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, queue.ErrClosed):
 		metrics.EventsRejected.WithLabelValues("shutdown").Inc()
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+	case errors.Is(err, queue.ErrUnavailable):
+		metrics.EventsRejected.WithLabelValues("not_ingest").Inc()
+		http.Error(w, "this instance does not accept events (worker mode)", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "failed to accept event", http.StatusInternalServerError)
 	}

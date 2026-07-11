@@ -23,6 +23,17 @@ var ErrFull = errors.New("queue is full")
 // ErrClosed means the queue is shutting down and accepts no new events.
 var ErrClosed = errors.New("queue is closed")
 
+// ErrUnavailable means this instance does not accept events at all (e.g. a
+// worker-only process in Kafka mode).
+var ErrUnavailable = errors.New("ingest unavailable on this instance")
+
+// Reject is an Enqueuer that refuses everything — used by worker-only
+// instances so the ingest route answers honestly instead of panicking.
+type Reject struct{}
+
+// Enqueue always fails with ErrUnavailable.
+func (Reject) Enqueue(store.Event) error { return ErrUnavailable }
+
 // Memory is a bounded in-process queue backed by a buffered channel.
 //
 // Shutdown contract: the HTTP server must be stopped BEFORE Close is called,
