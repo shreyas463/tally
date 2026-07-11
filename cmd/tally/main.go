@@ -9,13 +9,18 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/shreyas463/tally/internal/dashboard"
 	"github.com/shreyas463/tally/internal/ingest"
+	"github.com/shreyas463/tally/internal/metrics"
 	"github.com/shreyas463/tally/internal/queue"
 	"github.com/shreyas463/tally/internal/store"
 	"github.com/shreyas463/tally/internal/worker"
@@ -60,16 +65,44 @@ func main() {
 		BatchSize:     cfg.batchSize,
 		FlushInterval: cfg.flushInterval,
 		OnFlush: func(fi worker.FlushInfo) {
+			metrics.BatchSize.Observe(float64(fi.BatchSize))
+			metrics.FlushDuration.Observe(fi.Took.Seconds())
 			if fi.Err != nil {
+				metrics.EventsDropped.Add(float64(fi.BatchSize))
 				log.Printf("flush FAILED: batch=%d err=%v", fi.BatchSize, fi.Err)
+				return
 			}
+			metrics.EventsInserted.Add(float64(fi.Inserted))
+			metrics.EventsDuplicate.Add(float64(fi.Duplicates))
 		},
 	})
 	pool.Start()
 
+	// Sample the queue depth for the tally_queue_depth gauge.
+	depthDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				metrics.QueueDepth.Set(float64(q.Depth()))
+			case <-depthDone:
+				return
+			}
+		}
+	}()
+
 	// HTTP.
 	mux := http.NewServeMux()
 	ingest.New(q, st).Register(mux)
+	dashboard.Register(mux)
+	mux.Handle("GET /metrics", promhttp.Handler())
+	// pprof, for profiling under load (see BENCHMARKS.md). The Index handler
+	// also serves the named profiles (heap, goroutine, ...) under this prefix.
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 
 	srv := &http.Server{
 		Addr:         cfg.addr,
@@ -104,6 +137,7 @@ func main() {
 	}
 
 	log.Println("shutting down: draining queue...")
+	close(depthDone)
 	q.Close()
 	pool.Wait()
 

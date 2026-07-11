@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tally — live events</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #21262d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #3fb950; --bar: #238636;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 32px 24px; max-width: 960px; margin: 0 auto;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+  h1 { font-size: 22px; letter-spacing: -0.02em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.live { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin-bottom: 14px; font-weight: 600;
+  }
+  .big { font-size: 42px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .unit { color: var(--muted); font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 0; font-variant-numeric: tabular-nums; }
+  td.name { color: var(--text); }
+  td.count { text-align: right; color: var(--muted); }
+  .rowbar { height: 4px; background: var(--bar); border-radius: 2px; margin-top: 2px; }
+  #chart { display: flex; align-items: flex-end; gap: 3px; height: 140px; margin-top: 6px; }
+  .col { flex: 1; background: var(--bar); border-radius: 2px 2px 0 0; min-height: 1px; transition: height 0.4s ease; }
+  .col:hover { background: var(--accent); }
+  .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Tally</h1>
+    <span class="dot" id="dot"></span>
+  </header>
+  <div class="sub">live event counts · refreshes every 2s</div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Events today</h2>
+      <div class="big" id="total">–</div>
+      <div class="unit">across all event types (UTC day)</div>
+    </div>
+    <div class="panel">
+      <h2>Events per minute — last 15 min</h2>
+      <div id="chart"><div class="empty">waiting for data…</div></div>
+      <div class="axis"><span>-15m</span><span>now</span></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top: 16px;">
+    <h2>Top events today</h2>
+    <table id="top"><tr><td class="empty">waiting for data…</td></tr></table>
+  </div>
+
+  <footer>served from the tally binary · <a href="/metrics">/metrics</a> · <a href="/healthz">/healthz</a></footer>
+
+<script>
+const fmt = n => n.toLocaleString();
+
+async function tick() {
+  const dot = document.getElementById("dot");
+  try {
+    const res = await fetch("/v1/stats");
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    dot.classList.add("live");
+    render(data);
+  } catch (e) {
+    dot.classList.remove("live");
+  }
+}
+
+function render(data) {
+  const totals = data.totals_today || [];
+  const series = data.series || [];
+
+  // Big number: sum of all totals.
+  const total = totals.reduce((a, t) => a + t.count, 0);
+  document.getElementById("total").textContent = fmt(total);
+
+  // Top events table with proportional bars.
+  const top = document.getElementById("top");
+  if (totals.length === 0) {
+    top.innerHTML = '<tr><td class="empty">no events yet — send one!</td></tr>';
+  } else {
+    const max = totals[0].count || 1;
+    top.innerHTML = totals.map(t => `
+      <tr>
+        <td class="name">${escapeHTML(t.name)}
+          <div class="rowbar" style="width:${Math.max(2, 100 * t.count / max)}%"></div>
+        </td>
+        <td class="count">${fmt(t.count)}</td>
+      </tr>`).join("");
+  }
+
+  // Per-minute chart: bucket series by minute (all names summed), fill the
+  // last 15 minutes so quiet minutes show as gaps, not missing bars.
+  const byMinute = new Map();
+  for (const p of series) {
+    const key = new Date(p.minute).getTime();
+    byMinute.set(key, (byMinute.get(key) || 0) + p.count);
+  }
+  const now = Date.now();
+  const cols = [];
+  for (let i = 15; i >= 0; i--) {
+    const bucket = new Date(now - i * 60000);
+    bucket.setSeconds(0, 0);
+    cols.push(byMinute.get(bucket.getTime()) || 0);
+  }
+  const peak = Math.max(...cols, 1);
+  document.getElementById("chart").innerHTML = cols.map(v =>
+    `<div class="col" style="height:${Math.max(1, 100 * v / peak)}%" title="${fmt(v)} events"></div>`
+  ).join("");
+}
+
+function escapeHTML(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

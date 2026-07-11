@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/shreyas463/tally/internal/metrics"
 	"github.com/shreyas463/tally/internal/queue"
 	"github.com/shreyas463/tally/internal/store"
 )
@@ -56,18 +57,22 @@ type eventRequest struct {
 
 // postEvent receives one event, validates it, and queues it.
 func (h *Handler) postEvent(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB cap
 
 	var req eventRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		metrics.EventsRejected.WithLabelValues("invalid").Inc()
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
 	if req.EventID == "" {
+		metrics.EventsRejected.WithLabelValues("invalid").Inc()
 		http.Error(w, "event_id is required", http.StatusBadRequest)
 		return
 	}
 	if req.Name == "" {
+		metrics.EventsRejected.WithLabelValues("invalid").Inc()
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
@@ -82,13 +87,17 @@ func (h *Handler) postEvent(w http.ResponseWriter, r *http.Request) {
 
 	switch err := h.queue.Enqueue(e); {
 	case err == nil:
+		metrics.EventsAccepted.Inc()
+		metrics.IngestDuration.Observe(time.Since(start).Seconds())
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 	case errors.Is(err, queue.ErrFull):
 		// Backpressure: tell the caller to slow down and retry, rather than
 		// silently dropping their event.
+		metrics.EventsRejected.WithLabelValues("queue_full").Inc()
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "overloaded, retry shortly", http.StatusServiceUnavailable)
 	case errors.Is(err, queue.ErrClosed):
+		metrics.EventsRejected.WithLabelValues("shutdown").Inc()
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "failed to accept event", http.StatusInternalServerError)
